@@ -1,0 +1,27 @@
+name: Catarina secret scan
+description: Find leaked API keys and passwords in your code and git history. Runs offline; never prints a full secret.
+author: Catarina Secrets
+branding:
+  icon: lock
+  color: red
+inputs:
+  history:
+    description: Also scan every line ever committed (needs actions/checkout with fetch-depth 0).
+    default: "true"
+  path:
+    description: Folder to scan.
+    default: "."
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - shell: bash
+      env:
+        CSEC_PATH: ${{ inputs.path }}
+        CSEC_HISTORY: ${{ inputs.history }}
+      run: |
+        args=(scan "$CSEC_PATH")
+        if [ "$CSEC_HISTORY" = "true" ]; then args+=(--history); fi
+        node "$GITHUB_ACTION_PATH/csec.js" "${args[@]}"

@@ -1,0 +1,50 @@
+{
+  "name": "catarina-secrets",
+  "version": "0.1.0",
+  "description": "Find leaked API keys in your code and git history, and keep secrets in an encrypted vault your apps and AI agents use without seeing them.",
+  "type": "module",
+  "bin": {
+    "csec": "csec.js"
+  },
+  "files": [
+    "csec.js",
+    "scan.js",
+    "crypto.js",
+    "se-helper.swift",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "homepage": "https://secret.getcatarina.com/?utm_source=npm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/btaskol/catarina-secrets-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/btaskol/catarina-secrets-cli/issues",
+    "email": "security@getcatarina.com"
+  },
+  "keywords": [
+    "secret-scanner",
+    "leaked-keys",
+    "pre-commit",
+    "secrets",
+    "secret-manager",
+    "env",
+    "dotenv",
+    "api-keys",
+    "mcp",
+    "mcp-server",
+    "ai-agents",
+    "claude-code",
+    "cursor",
+    "passkeys",
+    "end-to-end-encryption"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
