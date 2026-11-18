@@ -260,6 +260,12 @@ async function openVault(reason, unlocked) {
 }
 
 /** Encrypt on this device and upload. entries: [{ existing?: item, data: {name, value, notes, project, env} }] */
+/** A decrypted item minus what openVault adds, so fields this CLI doesn't know (tags from the vault page) survive. */
+function keepFields(existing) {
+  if (!existing) return {};
+  const { id, version, ...data } = existing;
+  return data;
+}
 async function putItems(ctx, entries) {
   const payload = [];
   for (const e of entries) {
@@ -438,7 +444,7 @@ async function list(args) {
   const { items } = await openVault("list your secrets");
   if (all) {
     if (!items.length) return out("No secrets in the vault.");
-    const rows = items.map((it) => [projOf(it) || "-", envOf(it) || "(all)", it.name])
+    const rows = items.map((it) => [projOf(it) || "-", envOf(it) || "(all)", it.name + tagText(it)])
       .sort((a, b) => a.join("\0").localeCompare(b.join("\0")));
     const w0 = Math.max(7, ...rows.map((r) => r[0].length)), w1 = Math.max(3, ...rows.map((r) => r[1].length));
     process.stdout.write(`${"PROJECT".padEnd(w0)}  ${"ENV".padEnd(w1)}  NAME\n`);
@@ -447,7 +453,12 @@ async function list(args) {
   }
   const scoped = inScope(items, scope);
   out(`${scope.label}: ${scoped.length} secret(s)${scope.project ? "" : "  (tip: csec init <project>, or csec list --all)"}`);
-  for (const it of scoped) process.stdout.write(`${it.name}${envOf(it) ? "" : "   (all envs)"}${ENV_NAME.test(it.name) ? "" : "   (not a valid env var name)"}\n`);
+  for (const it of scoped) process.stdout.write(`${it.name}${envOf(it) ? "" : "   (all envs)"}${ENV_NAME.test(it.name) ? "" : "   (not a valid env var name)"}${tagText(it)}\n`);
+}
+/** Tags set in the vault page, shown as "   #billing #stripe". */
+function tagText(it) {
+  const tags = Array.isArray(it.tags) ? it.tags.filter((t) => typeof t === "string" && /^[a-z0-9][a-z0-9_-]{0,23}$/.test(t)) : [];
+  return tags.length ? "   " + tags.map((t) => "#" + t).join(" ") : "";
 }
 
 async function get(args) {
@@ -510,7 +521,7 @@ async function set(args) {
   if (!value) die("Empty value, nothing saved.");
   const ctx = await openVault(`save ${name} (${scope.project || "no project"} / ${env || "all envs"})`);
   const existing = ctx.items.find((it) => it.name === name && projOf(it) === scope.project && envOf(it) === env);
-  await putItems(ctx, [{ existing, data: { name, value, notes: existing ? existing.notes || "" : "", project: scope.project, env } }]);
+  await putItems(ctx, [{ existing, data: { ...keepFields(existing), name, value, notes: existing ? existing.notes || "" : "", project: scope.project, env } }]);
   out(`✓ ${existing ? "Updated" : "Saved"} ${name} in ${scope.project || "(no project)"} / ${env || "all envs"}.${generate ? ` Generated ${genOpts.length}-char ${genOpts.type} (≈${C.secretBits(genOpts.type, genOpts.length)} bits), not shown.` : ""}`);
 }
 
@@ -643,7 +654,7 @@ async function importEnv(args) {
     const existing = ctx.items.find((it) => it.name === key && projOf(it) === scope.project && envOf(it) === scope.env);
     if (existing && existing.value === value) { report.same.push(key); continue; }
     if (existing && !overwrite) { report.skipped.push(key); continue; }
-    toSave.push({ existing, data: { name: key, value, notes: existing ? existing.notes || "" : `imported from ${file}`, project: scope.project, env: scope.env } });
+    toSave.push({ existing, data: { ...keepFields(existing), name: key, value, notes: existing ? existing.notes || "" : `imported from ${file}`, project: scope.project, env: scope.env } });
     (existing ? report.updated : report.created).push(key);
   }
   if (toSave.length) await putItems(ctx, toSave);
@@ -930,7 +941,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.1" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.2" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }
