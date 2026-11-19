@@ -137,6 +137,20 @@ csec proxy
 and `CATARINA_GRANT_TOKEN` (shown once). The agent calls `$CATARINA_BASE_URL/<api-path>` with
 `Authorization: Bearer $CATARINA_GRANT_TOKEN`, and the broker adds the real key only for `api.openai.com`. `csec grants` lists grants and `csec revoke <id>` ends one early.
 
+## Any app or SDK, without code changes
+
+```sh
+csec connect openai -- python agent.py
+csec connect openai anthropic:CLAUDE_KEY -- npm run dev
+csec connect STRIPE_KEY@api.stripe.com -- node billing.js
+```
+
+`csec connect` sets the variables SDKs already read (`OPENAI_API_KEY` + `OPENAI_BASE_URL`,
+`ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL`, or `NAME` + `NAME_BASE_URL`) to a grant token and a
+local proxy address, then runs your command. The official OpenAI and Anthropic SDKs go through the
+broker unchanged, and nothing in your app holds the real key. One Touch ID approval per run; the
+grants last 1 hour by default (`--for`) and are revoked when the command exits.
+
 ## Security
 
 - Secrets are encrypted with AES-256-GCM on your devices. The vault key is unlocked by a passkey or

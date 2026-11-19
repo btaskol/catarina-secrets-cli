@@ -699,11 +699,11 @@ function parseDuration(text) {
 const fmtTime = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
 /** Decrypt one secret on this device and register a split-key broker grant for it. Shows Touch ID. */
-async function createGrant({ scope, name, host, ttl, header, label, maxUses = null }) {
+async function createGrant({ scope, name, host, ttl, header, label, maxUses = null, ctx = null }) {
   const hm = String(header).match(/^([A-Za-z0-9-]{1,64}):\s*(.+)$/);
   if (!hm || !hm[2].includes("{secret}")) die('The auth header must look like "Header-Name: ...{secret}..."');
   host = String(host || "").toLowerCase();
-  const ctx = await openVault(`let "${label}" use ${name} on ${host} for ${Math.round(ttl / 60)} min`);
+  ctx = ctx || (await openVault(`let "${label}" use ${name} on ${host} for ${Math.round(ttl / 60)} min`));
   const it = inScope(ctx.items, scope).find((x) => x.name === name);
   if (!it) die(`No secret named ${name} in ${scope.label}.`);
   const id = crypto.randomUUID();
@@ -787,9 +787,9 @@ async function revoke(args) {
   out(`✓ Revoked grant ${matches[0].id.slice(0, 8)}.`);
 }
 
-/** Local proxy for agents on this machine: adds the Access service token, maps PUT/PATCH/DELETE for the WAF. */
-async function proxy(args) {
-  const port = Number(takeFlag(args, ["--port"]) || 7777);
+/** Local proxy for agents on this machine: adds the Access service token, maps PUT/PATCH/DELETE for the WAF.
+ *  Responses are streamed, so server-sent events (streamed AI replies) arrive as they come. */
+function startProxyServer(port, log = out) {
   const access = accessHeaders();
   const server = createServer(async (req, res) => {
     const reject = (code, error) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, error })); };
@@ -815,16 +815,93 @@ async function proxy(args) {
       const outHeaders = {};
       up.headers.forEach((v, k) => { if (!["content-encoding", "content-length", "transfer-encoding"].includes(k)) outHeaders[k] = v; });
       res.writeHead(up.status, outHeaders);
-      res.end(Buffer.from(await up.arrayBuffer()));
-      out(`${new Date().toLocaleTimeString()}  ${req.method} ${m[1].slice(0, 8)}${(m[2] || "/").split("?")[0]} → ${up.status}`);
+      if (up.body) for await (const chunk of up.body) res.write(chunk);
+      res.end();
+      log(`${new Date().toLocaleTimeString()}  ${req.method} ${m[1].slice(0, 8)}${(m[2] || "/").split("?")[0]} → ${up.status}`);
     } catch (e) {
+      if (res.headersSent) return res.destroy();
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "proxy_error", detail: String(e.message) }));
     }
   });
-  server.listen(port, "127.0.0.1", () => {
-    out(`✓ Broker proxy on http://127.0.0.1:${port}  →  ${BASE}/api/broker`);
-    out("  Only reachable from this computer. Agents still need a grant token for each request. Ctrl+C to stop.");
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => resolve(server));
+  });
+}
+
+async function proxy(args) {
+  const port = Number(takeFlag(args, ["--port"]) || 7777);
+  await startProxyServer(port).catch((e) => die(`Could not start the proxy on port ${port}: ${e.code || e.message}`));
+  out(`✓ Broker proxy on http://127.0.0.1:${port}  →  ${BASE}/api/broker`);
+  out("  Only reachable from this computer. Agents still need a grant token for each request. Ctrl+C to stop.");
+}
+
+// ---------- csec connect: run any app or agent with grant tokens instead of real keys ----------
+// Each SDK gets a base URL pointing at a local proxy and a grant token where it expects its API key.
+// The real key is added by the broker, only for the host of that preset. Nothing in the child holds it.
+const CONNECT_PRESETS = {
+  openai: { secret: "OPENAI_API_KEY", host: "api.openai.com", header: "Authorization: Bearer {secret}", keyVar: "OPENAI_API_KEY", urlVar: "OPENAI_BASE_URL", path: "/v1" },
+  anthropic: { secret: "ANTHROPIC_API_KEY", host: "api.anthropic.com", header: "x-api-key: {secret}", keyVar: "ANTHROPIC_API_KEY", urlVar: "ANTHROPIC_BASE_URL", path: "" },
+};
+const HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+/** "openai", "openai:MY_KEY", "anthropic:CLAUDE_KEY" or "STRIPE_KEY@api.stripe.com". */
+function parseConnectSpec(spec, header) {
+  const custom = spec.match(/^([A-Za-z_][A-Za-z0-9_]*)@([A-Za-z0-9.-]+)$/);
+  if (custom) {
+    const host = custom[2].toLowerCase();
+    if (!HOST_RE.test(host)) die(`"${custom[2]}" isn't a public hostname.`);
+    return { secret: custom[1], host, header: header || "Authorization: Bearer {secret}", keyVar: custom[1], urlVar: `${custom[1]}_BASE_URL`, path: "" };
+  }
+  const [preset, name] = spec.split(":");
+  const p = CONNECT_PRESETS[preset.toLowerCase()];
+  if (!p) die(`Unknown API "${spec}". Use ${Object.keys(CONNECT_PRESETS).join(", ")} (optionally :SECRET_NAME), or SECRET_NAME@api.example.com.`);
+  if (name !== undefined && !ENV_NAME.test(name)) die(`"${name}" isn't a valid secret name.`);
+  return { ...p, secret: name || p.secret };
+}
+
+async function connectCmd(args) {
+  const sep = args.indexOf("--");
+  const own = sep >= 0 ? args.slice(0, sep) : args;
+  const cmd = sep >= 0 ? args.slice(sep + 1) : [];
+  const ttl = parseDuration(takeFlag(own, ["--for"]) || "1h");
+  const header = takeFlag(own, ["--header"]);
+  const label = (takeFlag(own, ["--label"]) || (cmd[0] ? basename(cmd[0]) : "connect")).slice(0, 64);
+  const port = Number(takeFlag(own, ["--port"]) || 0);
+  const scope = resolveScope(own);
+  const usage = "Usage: csec connect openai|anthropic[:SECRET] | SECRET@host … [--for 1h] -- <command> [args…]";
+  if (!own.length || !cmd.length) die(usage);
+  const specs = own.map((x) => parseConnectSpec(x, header));
+  if (new Set(specs.map((x) => x.keyVar)).size !== specs.length) die("Each API can be connected once.");
+
+  const ctx = await openVault(`let "${label}" use ${specs.map((x) => `${x.secret} on ${x.host}`).join(", ")} for ${Math.round(ttl / 60)} min`);
+  const have = new Set(inScope(ctx.items, scope).map((it) => it.name));
+  const missing = specs.filter((x) => !have.has(x.secret)).map((x) => x.secret);
+  if (missing.length) die(`No secret named ${missing.join(", ")} in ${scope.label}. Pick one with openai:NAME, or see csec list.`);
+  const server = await startProxyServer(port, () => {}).catch((e) => die(`Could not start the local proxy: ${e.code || e.message}`));
+  const local = `http://127.0.0.1:${server.address().port}`;
+  const env = { ...process.env };
+  const made = [];
+  for (const x of specs) {
+    const g = await createGrant({ scope, name: x.secret, host: x.host, ttl, header: x.header, label, ctx });
+    made.push(g.id);
+    env[x.keyVar] = g.token;
+    env[x.urlVar] = `${local}/${g.id}${x.path}`;
+    out(`✓ ${x.secret} → https://${x.host} until ${fmtTime(g.expires_at)}  (${x.urlVar}, ${x.keyVar} = grant token)`);
+  }
+  out("  The app gets grant tokens, never the real keys. They stop working when it exits.");
+
+  const revokeAll = async () => {
+    for (const id of made) await signedFetch(ctx.dev, "/api/device/grants/revoke", "POST", { id }).catch(() => {});
+  };
+  const child = spawn(cmd[0], cmd.slice(1), { stdio: "inherit", env });
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => child.kill(sig));
+  child.on("error", async (e) => { await revokeAll(); die(`Could not start ${cmd[0]}: ${e.message}`, 127); });
+  child.on("exit", async (code, signal) => {
+    server.close();
+    await revokeAll();
+    process.exit(signal ? 128 + (osConstants.signals[signal] || 1) : code ?? 0);
   });
 }
 
@@ -941,7 +1018,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.2" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.3" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }
@@ -1163,6 +1240,8 @@ const HELP = `csec — Catarina Secrets CLI
   csec grants                       List broker grants
   csec revoke <grant-id>            Revoke a grant early
   csec proxy [--port 7777]          Local broker proxy for agents on this computer
+  csec connect openai|anthropic[:SECRET] | SECRET@host … [--for 1h] -- <cmd>
+                                    Run an app with base URLs + grant tokens instead of real keys
   csec mcp                          MCP server (stdio) for AI agents: list_secrets, call_api
   csec touchid [status|on|off]      Require Touch ID (Secure Enclave) before secrets are used
   csec status                       Show link status, device fingerprint and current scope
@@ -1179,7 +1258,7 @@ const HELP = `csec — Catarina Secrets CLI
 Server: ${BASE}  (override with CATARINA_URL)`;
 
 const [cmd, ...args] = process.argv.slice(2);
-const commands = { login, init, run, get, list, ls: list, set, gen, delete: del, rm: del, trash, restore, purge, backup, import: importEnv, status, logout, "access-token": accessToken, grant, grants, revoke, proxy, touchid, mcp, scan };
+const commands = { login, init, run, get, list, ls: list, set, gen, delete: del, rm: del, trash, restore, purge, backup, import: importEnv, status, logout, "access-token": accessToken, grant, grants, revoke, proxy, connect: connectCmd, touchid, mcp, scan };
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") { out(HELP); process.exit(0); }
 if (cmd === "version" || cmd === "--version" || cmd === "-v") {
   // The npm build writes package.json next to csec.js; in the repo it's two folders up.
