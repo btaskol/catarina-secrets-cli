@@ -145,10 +145,14 @@ csec connect openai anthropic:CLAUDE_KEY -- npm run dev
 csec connect STRIPE_KEY@api.stripe.com -- node billing.js
 ```
 
-`csec connect` sets the variables SDKs already read (`OPENAI_API_KEY` + `OPENAI_BASE_URL`,
-`ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL`, or `NAME` + `NAME_BASE_URL`) to a grant token and a
-local proxy address, then runs your command. The official OpenAI and Anthropic SDKs go through the
-broker unchanged, and nothing in your app holds the real key. One Touch ID approval per run; the
+`csec connect` sets an API's key and base-URL variables (for example `OPENAI_API_KEY` +
+`OPENAI_BASE_URL`, or `NAME` + `NAME_BASE_URL` for `NAME@host`) to a grant token and a local proxy
+address, then runs your command. Nothing in your app holds the real key.
+
+Presets: `openai`, `anthropic`, `gemini`, `groq`, `mistral`, `xai`, `deepseek`, `openrouter`,
+`github` (`csec connect --list`). The OpenAI and Anthropic SDKs, the Google Gen AI SDK for
+JavaScript and Go, and the Groq SDK for JavaScript read the base URL by themselves; with the others,
+pass the `…_BASE_URL` variable as the client's base URL (one line). One Touch ID approval per run; the
 grants last 1 hour by default (`--for`) and are revoked when the command exits.
 
 ## Security

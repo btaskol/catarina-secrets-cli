@@ -840,10 +840,20 @@ async function proxy(args) {
 // ---------- csec connect: run any app or agent with grant tokens instead of real keys ----------
 // Each SDK gets a base URL pointing at a local proxy and a grant token where it expects its API key.
 // The real key is added by the broker, only for the host of that preset. Nothing in the child holds it.
+// auto: the official SDK reads urlVar by itself. Otherwise the app passes it as its client's base URL (one line).
+const bearer = "Authorization: Bearer {secret}";
 const CONNECT_PRESETS = {
-  openai: { secret: "OPENAI_API_KEY", host: "api.openai.com", header: "Authorization: Bearer {secret}", keyVar: "OPENAI_API_KEY", urlVar: "OPENAI_BASE_URL", path: "/v1" },
-  anthropic: { secret: "ANTHROPIC_API_KEY", host: "api.anthropic.com", header: "x-api-key: {secret}", keyVar: "ANTHROPIC_API_KEY", urlVar: "ANTHROPIC_BASE_URL", path: "" },
+  openai: { host: "api.openai.com", header: bearer, keyVar: "OPENAI_API_KEY", urlVar: "OPENAI_BASE_URL", path: "/v1", auto: "OpenAI SDKs" },
+  anthropic: { host: "api.anthropic.com", header: "x-api-key: {secret}", keyVar: "ANTHROPIC_API_KEY", urlVar: "ANTHROPIC_BASE_URL", path: "", auto: "Anthropic SDKs" },
+  gemini: { host: "generativelanguage.googleapis.com", header: "x-goog-api-key: {secret}", keyVar: "GEMINI_API_KEY", urlVar: "GOOGLE_GEMINI_BASE_URL", path: "", auto: "Google Gen AI SDK for JavaScript and Go", unset: ["GOOGLE_API_KEY"] },
+  groq: { host: "api.groq.com", header: bearer, keyVar: "GROQ_API_KEY", urlVar: "GROQ_BASE_URL", path: "", auto: "Groq SDK for JavaScript" },
+  mistral: { host: "api.mistral.ai", header: bearer, keyVar: "MISTRAL_API_KEY", urlVar: "MISTRAL_BASE_URL", path: "" },
+  xai: { host: "api.x.ai", header: bearer, keyVar: "XAI_API_KEY", urlVar: "XAI_BASE_URL", path: "/v1" },
+  deepseek: { host: "api.deepseek.com", header: bearer, keyVar: "DEEPSEEK_API_KEY", urlVar: "DEEPSEEK_BASE_URL", path: "" },
+  openrouter: { host: "openrouter.ai", header: bearer, keyVar: "OPENROUTER_API_KEY", urlVar: "OPENROUTER_BASE_URL", path: "/api/v1" },
+  github: { host: "api.github.com", header: bearer, keyVar: "GITHUB_TOKEN", urlVar: "GITHUB_API_URL", path: "", auto: "GitHub Actions toolkit" },
 };
+for (const p of Object.values(CONNECT_PRESETS)) p.secret = p.keyVar;
 const HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
 /** "openai", "openai:MY_KEY", "anthropic:CLAUDE_KEY" or "STRIPE_KEY@api.stripe.com". */
@@ -856,7 +866,7 @@ function parseConnectSpec(spec, header) {
   }
   const [preset, name] = spec.split(":");
   const p = CONNECT_PRESETS[preset.toLowerCase()];
-  if (!p) die(`Unknown API "${spec}". Use ${Object.keys(CONNECT_PRESETS).join(", ")} (optionally :SECRET_NAME), or SECRET_NAME@api.example.com.`);
+  if (!p) die(`Unknown API "${spec}". Presets: ${Object.keys(CONNECT_PRESETS).join(", ")} (optionally :SECRET_NAME), or SECRET_NAME@api.example.com.`);
   if (name !== undefined && !ENV_NAME.test(name)) die(`"${name}" isn't a valid secret name.`);
   return { ...p, secret: name || p.secret };
 }
@@ -870,7 +880,14 @@ async function connectCmd(args) {
   const label = (takeFlag(own, ["--label"]) || (cmd[0] ? basename(cmd[0]) : "connect")).slice(0, 64);
   const port = Number(takeFlag(own, ["--port"]) || 0);
   const scope = resolveScope(own);
-  const usage = "Usage: csec connect openai|anthropic[:SECRET] | SECRET@host … [--for 1h] -- <command> [args…]";
+  const usage = "Usage: csec connect <api>[:SECRET] | SECRET@host … [--for 1h] -- <command> [args…]   (APIs: csec connect --list)";
+  if (takeFlag(own, ["--list"], true)) {
+    for (const [name, p] of Object.entries(CONNECT_PRESETS)) {
+      process.stdout.write(`${name.padEnd(11)} ${p.host.padEnd(34)} ${p.keyVar} + ${p.urlVar}${p.auto ? `  (read automatically by the ${p.auto})` : ""}\n`);
+    }
+    out("  Use another secret name with preset:NAME, any other API with NAME@host.");
+    return;
+  }
   if (!own.length || !cmd.length) die(usage);
   const specs = own.map((x) => parseConnectSpec(x, header));
   if (new Set(specs.map((x) => x.keyVar)).size !== specs.length) die("Each API can be connected once.");
@@ -886,9 +903,11 @@ async function connectCmd(args) {
   for (const x of specs) {
     const g = await createGrant({ scope, name: x.secret, host: x.host, ttl, header: x.header, label, ctx });
     made.push(g.id);
+    for (const v of x.unset || []) delete env[v]; // an SDK would prefer it over keyVar
     env[x.keyVar] = g.token;
     env[x.urlVar] = `${local}/${g.id}${x.path}`;
-    out(`✓ ${x.secret} → https://${x.host} until ${fmtTime(g.expires_at)}  (${x.urlVar}, ${x.keyVar} = grant token)`);
+    out(`✓ ${x.secret} → https://${x.host} until ${fmtTime(g.expires_at)}  (${x.keyVar} = grant token, ${x.urlVar} = local proxy)`);
+    if (!x.auto) out(`  Pass ${x.urlVar} to your client as its base URL; its SDK doesn't read it by itself.`);
   }
   out("  The app gets grant tokens, never the real keys. They stop working when it exits.");
 
@@ -1018,7 +1037,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.3" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.4" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }
@@ -1240,8 +1259,9 @@ const HELP = `csec — Catarina Secrets CLI
   csec grants                       List broker grants
   csec revoke <grant-id>            Revoke a grant early
   csec proxy [--port 7777]          Local broker proxy for agents on this computer
-  csec connect openai|anthropic[:SECRET] | SECRET@host … [--for 1h] -- <cmd>
+  csec connect <api>[:SECRET] | SECRET@host … [--for 1h] -- <cmd>
                                     Run an app with base URLs + grant tokens instead of real keys
+  csec connect --list               APIs with a preset (openai, anthropic, gemini, groq, mistral, …)
   csec mcp                          MCP server (stdio) for AI agents: list_secrets, call_api
   csec touchid [status|on|off]      Require Touch ID (Secure Enclave) before secrets are used
   csec status                       Show link status, device fingerprint and current scope
