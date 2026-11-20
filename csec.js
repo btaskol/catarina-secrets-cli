@@ -5,9 +5,10 @@
 
 import { spawn, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
+import { createServer as netServer, createConnection } from "node:net";
 import { hostname, homedir, platform, constants as osConstants } from "node:os";
 import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, realpathSync } from "node:fs";
-import { join, relative, basename } from "node:path";
+import { join, relative, basename, dirname } from "node:path";
 import * as C from "./crypto.js";
 import { scanFiles, scanHistory, scanStaged, summarize, isEnvFile } from "./scan.js";
 
@@ -470,21 +471,210 @@ async function get(args) {
   process.stdout.write(it.value + (process.stdout.isTTY ? "\n" : ""));
 }
 
+// ---------- unlock sessions: one Touch ID for a project, for a while ----------
+// `csec unlock` decrypts ONE project/env (minus secrets tagged "always-ask") and hands the values to a
+// small background helper that keeps them in memory only. `csec run` for that scope then skips Touch ID,
+// but only when it's started from the same session that unlocked it (the Claude Code session or the
+// terminal tab: the nearest ancestor process that isn't a `sh -c` / npm wrapper). The helper forgets
+// everything after the chosen time, 30 min idle, 200 uses, when that session ends, on screen lock or
+// sleep, or on `csec lock`. A process that already runs as you could still impersonate a csec call
+// from that session; the limits keep that window small and visible.
+
+const TEST_MODE = process.env.CSEC_TEST_FILE_STORE === "1" && /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(HOST);
+const SESSION_SOCK = (TEST_MODE && process.env.CSEC_TEST_SOCK) || join(homedir(), ".config", "catarina", `session-${HOST.replace(/[^\w.-]/g, "_")}.sock`);
+const SESSION_MAX = 8 * 3600, SESSION_IDLE = 30 * 60, SESSION_USES = 200;
+const ALWAYS_ASK = "always-ask";
+const WRAPPER_RE = /(^|\/)(sh|bash|zsh|dash|fish)\s+(-\S+\s+)*-\w*c\b|(^|\/)npx\b|npm-cli\.js|npm exec|(^|\/)npm\s+(run|exec)\b|(^|\s|\/)(csec|catarina\.js)(\s|$)/;
+
+function procInfo(pid) {
+  try {
+    const line = execFileSync("ps", ["-o", "ppid=,lstart=,command=", "-p", String(pid)], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    const m = line.match(/^(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)$/);
+    return m ? { pid: Number(pid), ppid: Number(m[1]), start: m[2].replace(/\s+/g, " "), command: m[3] } : null;
+  } catch { return null; }
+}
+/** The session a csec process belongs to: walk up past `sh -c`, npm/npx and csec itself. */
+function sessionAnchor(pid) {
+  let cur = procInfo(pid);
+  for (let i = 0; cur && i < 40; i++) {
+    const parent = procInfo(cur.ppid);
+    if (!parent || parent.pid <= 1) return null;
+    if (!WRAPPER_RE.test(parent.command)) {
+      const c = parent.command;
+      const label = /claude/i.test(c) ? "this Claude Code session" : /^-|(^|\/)(zsh|bash|fish|sh)(\s|$)/.test(c) ? "this terminal" : basename(c.split(/\s+/)[0]);
+      return { pid: parent.pid, start: parent.start, label };
+    }
+    cur = parent;
+  }
+  return null;
+}
+
+function sessionCall(req, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    if (!existsSync(SESSION_SOCK)) return resolve(null);
+    const sock = createConnection(SESSION_SOCK);
+    let buf = "";
+    const done = (v) => { clearTimeout(t); sock.destroy(); resolve(v); };
+    const t = setTimeout(() => done(null), timeoutMs);
+    sock.on("connect", () => sock.write(JSON.stringify(req) + "\n"));
+    sock.on("data", (d) => { buf += d; if (buf.includes("\n")) { try { done(JSON.parse(buf)); } catch { done(null); } } });
+    sock.on("error", () => done(null));
+    sock.on("end", () => done(null));
+  });
+}
+
+async function ensureSessionDaemon() {
+  if (await sessionCall({ op: "ping" })) return true;
+  rmSync(SESSION_SOCK, { force: true });
+  const child = spawn(process.execPath, [process.argv[1], "session-daemon"], { detached: true, stdio: "ignore", env: process.env });
+  child.unref();
+  for (let i = 0; i < 50; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (await sessionCall({ op: "ping" })) return true;
+  }
+  return false;
+}
+
+async function unlock(args) {
+  const ttl = Math.min(parseDuration(takeFlag(args, ["--for"]) || "1h"), SESSION_MAX);
+  const scope = resolveScope(args);
+  if (!isMac && !TEST_MODE) die("Not needed here: csec only asks for Touch ID on a Mac.");
+  const anchor = sessionAnchor(process.pid);
+  if (!anchor) die("Couldn't tell which terminal or agent session this is, so nothing was unlocked.");
+  const ctx = await openVault(`unlock ${scope.label} for ${Math.round(ttl / 60)} min in ${anchor.label}`);
+  const scoped = inScope(ctx.items, scope).filter((it) => ENV_NAME.test(it.name));
+  const ask = scoped.filter((it) => (it.tags || []).includes(ALWAYS_ASK)).map((it) => it.name);
+  const values = Object.fromEntries(scoped.filter((it) => !ask.includes(it.name)).map((it) => [it.name, it.value]));
+  if (!Object.keys(values).length) die(`Nothing to unlock in ${scope.label}${ask.length ? ` (only "${ALWAYS_ASK}" secrets)` : ""}.`);
+  if (!(await ensureSessionDaemon())) die("Couldn't start the session helper.");
+  const r = await sessionCall({ op: "add", project: scope.project, env: scope.env, values, ask, anchor, ttl, label: scope.label });
+  if (!r || !r.ok) die(`Couldn't unlock (${(r && r.error) || "no answer from the session helper"}).`);
+  out(`✓ ${scope.label} unlocked for ${anchor.label} until ${fmtTime(r.expires_at)}: ${Object.keys(values).length} secret(s), no Touch ID for csec run.`);
+  if (ask.length) out(`  Still asks every time (tagged ${ALWAYS_ASK}): ${ask.join(", ")}`);
+  out(`  Ends after 30 min idle, ${SESSION_USES} uses, on screen lock or sleep, or with: csec lock`);
+}
+
+async function lock() {
+  const r = await sessionCall({ op: "lock" });
+  out(r && r.ok ? `✓ Locked. ${r.ended} unlocked session(s) ended.` : "Nothing was unlocked.");
+}
+
+/** Values from an unlock session for this process's session, or null (then Touch ID as usual). */
+async function fromSession(scope, what) {
+  if (!existsSync(SESSION_SOCK)) return null;
+  const r = await sessionCall({ op: "use", project: scope.project, env: scope.env, pid: process.pid, what });
+  return r && r.ok ? r : null;
+}
+
+async function sessionDaemon() {
+  const sessions = new Map(); // "project/env" → { values, ask, anchor, expires, idle, last, uses }
+  const logFile = join(dirname(SESSION_SOCK), "session.log");
+  const log = (line) => { try { writeFileSync(logFile, `${new Date().toISOString()}  ${line}\n`, { flag: "a", mode: 0o600 }); } catch {} };
+  const notify = (text) => {
+    if (TEST_MODE || !isMac) return;
+    const esc = (t) => t.replace(/["\\]/g, "");
+    spawn("osascript", ["-e", `display notification "${esc(text)}" with title "csec"`], { stdio: "ignore", detached: true }).unref();
+  };
+  const end = (key, why) => { if (sessions.delete(key)) log(`end ${key} (${why})`); };
+  const endAll = (why) => { for (const k of [...sessions.keys()]) end(k, why); };
+  const anchorAlive = (a) => { const p = procInfo(a.pid); return !!p && p.start === a.start; };
+
+  const server = netServer((sock) => {
+    let buf = "";
+    sock.on("data", (d) => {
+      buf += d;
+      if (!buf.includes("\n")) return;
+      let req; try { req = JSON.parse(buf); } catch { return sock.end('{"ok":false}\n'); }
+      const reply = (o) => sock.end(JSON.stringify(o) + "\n");
+      const now = Math.floor(Date.now() / 1000);
+      const key = `${req.project || ""}/${req.env || ""}`;
+      if (req.op === "ping") return reply({ ok: true });
+      if (req.op === "lock") { const n = sessions.size; endAll("csec lock"); reply({ ok: true, ended: n }); return setTimeout(() => process.exit(0), 50); }
+      if (req.op === "list") return reply({ ok: true, sessions: [...sessions].map(([k, x]) => ({ scope: x.label, until: x.expires, uses: x.uses, who: x.anchor.label })) });
+      if (req.op === "add") {
+        const a = req.anchor;
+        if (!a || !anchorAlive(a) || typeof req.values !== "object") return reply({ ok: false, error: "bad_request" });
+        const ttl = Math.min(Number(req.ttl) || 3600, SESSION_MAX);
+        sessions.set(key, { values: req.values, ask: req.ask || [], anchor: a, label: req.label, expires: now + ttl, last: now, uses: 0 });
+        log(`start ${key} for ${a.label} (${Math.round(ttl / 60)} min)`);
+        notify(`${req.label} unlocked for ${a.label}`);
+        return reply({ ok: true, expires_at: now + ttl });
+      }
+      if (req.op === "use") {
+        const x = sessions.get(key);
+        if (!x) return reply({ ok: false });
+        // Never trust the caller's word for its session: work it out from its process ID.
+        const caller = procInfo(req.pid);
+        const anchor = caller && /csec|catarina/.test(caller.command) ? sessionAnchor(req.pid) : null;
+        if (!anchor || anchor.pid !== x.anchor.pid || anchor.start !== x.anchor.start) { log(`refused ${key} for pid ${req.pid}`); return reply({ ok: false }); }
+        if (now >= x.expires || now - x.last >= SESSION_IDLE || x.uses >= SESSION_USES) { end(key, "time, idle or use limit"); return reply({ ok: false }); }
+        x.last = now; x.uses++;
+        const what = String(req.what || "").slice(0, 60);
+        log(`use ${key} by "${what}" (${x.uses}/${SESSION_USES})`);
+        notify(`${x.label} used by ${what}`);
+        return reply({ ok: true, values: x.values, ask: x.ask, until: x.expires });
+      }
+      reply({ ok: false, error: "unknown_op" });
+    });
+    sock.on("error", () => {});
+  });
+
+  mkdirSync(dirname(SESSION_SOCK), { recursive: true, mode: 0o700 });
+  rmSync(SESSION_SOCK, { force: true });
+  process.on("exit", () => { sessions.clear(); try { rmSync(SESSION_SOCK, { force: true }); } catch {} });
+  const old = process.umask(0o177);
+  server.listen(SESSION_SOCK, () => process.umask(old));
+
+  // Screen lock / sleep / user switch → forget everything. If the watcher can't run, sleep is still
+  // caught by the clock check below; screen lock then isn't, so say so in the log.
+  if (!TEST_MODE && isMac) {
+    const bin = await seHelper();
+    if (bin) {
+      const w = spawn(bin, ["watch"], { stdio: ["ignore", "pipe", "ignore"] });
+      w.stdout.on("data", (d) => { if (/lock|sleep|switch/.test(String(d))) { endAll(String(d).trim()); process.exit(0); } });
+      w.on("exit", () => { endAll("watcher stopped"); process.exit(0); });
+      process.on("exit", () => w.kill());
+    } else log("warning: screen-lock watcher unavailable");
+  }
+
+  let lastTick = Date.now();
+  setInterval(() => {
+    const nowMs = Date.now();
+    if (nowMs - lastTick > 30_000) endAll("the computer slept");
+    lastTick = nowMs;
+    const now = Math.floor(nowMs / 1000);
+    for (const [k, x] of sessions) {
+      if (now >= x.expires) end(k, "time is up");
+      else if (now - x.last >= SESSION_IDLE) end(k, "idle");
+      else if (!anchorAlive(x.anchor)) end(k, "its session ended");
+    }
+    if (!sessions.size && nowMs - started > 10_000) { server.close(); rmSync(SESSION_SOCK, { force: true }); process.exit(0); }
+  }, TEST_MODE ? 500 : 5000);
+  const started = Date.now();
+}
+
 async function run(args) {
   const sep = args.indexOf("--");
   const own = sep >= 0 ? args.slice(0, sep) : [];
   const cmd = sep >= 0 ? args.slice(sep + 1) : args;
   const scope = resolveScope(own);
   if (!cmd.length) die("Usage: csec run [-p project] [-e env] -- <command> [args…]");
-  const scoped = inScope((await openVault(`run "${cmd.join(" ").slice(0, 60)}" with ${scope.label} secrets`)).items, scope);
   const env = { ...process.env };
   let n = 0;
-  for (const it of scoped) {
-    if (!ENV_NAME.test(it.name)) continue;
-    env[it.name] = it.value;
-    n++;
+  const sess = await fromSession(scope, cmd.join(" "));
+  if (sess) {
+    for (const [k, v] of Object.entries(sess.values)) { env[k] = v; n++; }
+    out(`✓ ${n} secret(s) from ${scope.label} (unlocked until ${fmtTime(sess.until)}, no Touch ID)`);
+    if (sess.ask.length) out(`  Not included (tagged ${ALWAYS_ASK}, needs Touch ID): ${sess.ask.join(", ")}. Run csec lock first to get them.`);
+  } else {
+    const scoped = inScope((await openVault(`run "${cmd.join(" ").slice(0, 60)}" with ${scope.label} secrets`)).items, scope);
+    for (const it of scoped) {
+      if (!ENV_NAME.test(it.name)) continue;
+      env[it.name] = it.value;
+      n++;
+    }
+    out(`✓ ${n} secret(s) from ${scope.label} injected into the process (nothing written to disk)`);
   }
-  out(`✓ ${n} secret(s) from ${scope.label} injected into the process (nothing written to disk)`);
   const child = spawn(cmd[0], cmd.slice(1), { stdio: "inherit", env });
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => child.kill(sig));
   child.on("error", (e) => die(`Could not start ${cmd[0]}: ${e.message}`, 127));
@@ -1037,7 +1227,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.4" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.5" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }
@@ -1082,6 +1272,8 @@ async function status() {
   out(`Touch ID: ${dev.sealed ? "required (Secure Enclave)" : "off — turn on with: csec touchid on"}`);
   const signPub = dev.sign_pub || (dev.sign_priv ? C.toB64u(new Uint8Array(await crypto.subtle.exportKey("raw", await publicFromPkcs8(dev.sign_priv)))) : null);
   if (signPub) out(`Fingerprint: ${await C.deviceFingerprint(signPub, dev.enc_pub)}`);
+  const s = await sessionCall({ op: "list" });
+  for (const x of (s && s.sessions) || []) out(`Unlocked: ${x.scope} for ${x.who} until ${fmtTime(x.until)} (${x.uses} use(s)). End with: csec lock`);
 }
 async function publicFromPkcs8(signPrivB64u) {
   // Re-derive the Ed25519 public key from the stored private key via JWK (x is the public part).
@@ -1264,7 +1456,11 @@ const HELP = `csec — Catarina Secrets CLI
   csec connect --list               APIs with a preset (openai, anthropic, gemini, groq, mistral, …)
   csec mcp                          MCP server (stdio) for AI agents: list_secrets, call_api
   csec touchid [status|on|off]      Require Touch ID (Secure Enclave) before secrets are used
-  csec status                       Show link status, device fingerprint and current scope
+  csec unlock [-p P] [-e E] [--for 1h]
+                                    One Touch ID, then csec run skips it for this project in this
+                                    terminal / agent session (max 8h; ends on lock, sleep, 30 min idle)
+  csec lock                         End every unlock now
+  csec status                       Show link status, device fingerprint, current scope and unlocks
   csec logout                       Revoke this device and delete its keys
   csec scan [dir] [--history] [--json]
                                     Find API keys and passwords in files (and git history). Offline, no account
@@ -1278,7 +1474,7 @@ const HELP = `csec — Catarina Secrets CLI
 Server: ${BASE}  (override with CATARINA_URL)`;
 
 const [cmd, ...args] = process.argv.slice(2);
-const commands = { login, init, run, get, list, ls: list, set, gen, delete: del, rm: del, trash, restore, purge, backup, import: importEnv, status, logout, "access-token": accessToken, grant, grants, revoke, proxy, connect: connectCmd, touchid, mcp, scan };
+const commands = { login, init, run, get, list, ls: list, set, gen, delete: del, rm: del, trash, restore, purge, backup, import: importEnv, status, logout, "access-token": accessToken, grant, grants, revoke, proxy, connect: connectCmd, touchid, mcp, scan, unlock, lock, "session-daemon": sessionDaemon };
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") { out(HELP); process.exit(0); }
 if (cmd === "version" || cmd === "--version" || cmd === "-v") {
   // The npm build writes package.json next to csec.js; in the repo it's two folders up.

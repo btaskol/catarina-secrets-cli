@@ -84,6 +84,18 @@ csec run -- npm run dev             # start your app with the secrets as environ
 `csec list` shows names, `csec get NAME` prints one value, `csec run -e prod -- …` picks another
 environment.
 
+On a Mac every `csec run` asks for Touch ID. For a work session, approve one project once:
+
+```sh
+csec unlock -p my-app --for 2h   # one Touch ID; max 8h
+csec run -p my-app -- npm test   # no prompt, from this terminal or agent session only
+csec lock                        # end it now
+```
+
+It covers one project and environment, only `csec run`, and only the terminal tab or agent session
+that unlocked it. It ends after the time you chose, 30 minutes idle, 200 uses, or when your Mac locks
+or sleeps. Secrets tagged `always-ask` are never included.
+
 ## Claude Code
 
 Give Claude Code the MCP server, so it can **use** a key without ever reading it:

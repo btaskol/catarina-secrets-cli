@@ -9,7 +9,12 @@
 //       → {"shared": <base64 ECDH shared secret>}   (shows the Touch ID prompt)
 //
 // The "blob" is an encrypted handle that only this Mac's Secure Enclave can use.
+//
+//   csec-se watch
+//       Prints "lock", "sleep" or "switch" when the screen locks, the Mac goes to sleep or another
+//       user takes over, and keeps running. `csec unlock` sessions end on the first line.
 
+import AppKit
 import CryptoKit
 import Foundation
 import LocalAuthentication
@@ -25,7 +30,18 @@ func emit(_ obj: [String: String]) {
 
 func run() throws {
     let args = CommandLine.arguments
-    guard args.count >= 2 else { throw Fail(message: "usage: csec-se create | derive --reason TEXT") }
+    guard args.count >= 2 else { throw Fail(message: "usage: csec-se create | derive --reason TEXT | watch") }
+    if args[1] == "watch" {
+        let say = { (what: String) in print(what); fflush(stdout) }
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: nil) { _ in say("lock") }
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { _ in say("sleep") }
+        ws.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: nil) { _ in say("sleep") }
+        ws.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: nil) { _ in say("switch") }
+        say("ready")
+        RunLoop.main.run()
+    }
     guard SecureEnclave.isAvailable else { throw Fail(message: "secure_enclave_unavailable") }
 
     switch args[1] {
