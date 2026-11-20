@@ -1,6 +1,6 @@
 {
   "name": "catarina-secrets",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Find leaked API keys in your code and git history, and keep secrets in an encrypted vault your apps and AI agents use without seeing them.",
   "type": "module",
   "bin": {

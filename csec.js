@@ -466,6 +466,13 @@ async function get(args) {
   const scope = resolveScope(args);
   const name = args[0];
   if (!name) die("Usage: csec get NAME [-p project] [-e env]");
+  // Agents inside an unlock often reach for `get` and then wonder why Touch ID appears: say why, and
+  // what works without a prompt. (get prints the value, so an unlock never covers it.)
+  const sess = await sessionCall({ op: "list" });
+  if (((sess && sess.sessions) || []).some((x) => x.scope === scope.label) && ENV_NAME.test(name)) {
+    out(`! ${scope.label} is unlocked, but csec get always asks for Touch ID (it prints the value).`);
+    out(`  Without a prompt: csec run -p ${scope.project || '""'} -e ${scope.env} -- sh -c '… "$${name}" …'  (use the variable; don't print it)`);
+  }
   const it = inScope((await openVault(`read ${name} (${scope.label})`)).items, scope).find((x) => x.name === name);
   if (!it) die(`No secret named ${name} in ${scope.label}.`);
   process.stdout.write(it.value + (process.stdout.isTTY ? "\n" : ""));
@@ -1227,7 +1234,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.5" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.6" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }
