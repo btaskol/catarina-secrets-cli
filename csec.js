@@ -463,15 +463,20 @@ function tagText(it) {
 }
 
 async function get(args) {
+  const ask = takeFlag(args, ["--ask"], true);
   const scope = resolveScope(args);
   const name = args[0];
-  if (!name) die("Usage: csec get NAME [-p project] [-e env]");
-  // Agents inside an unlock often reach for `get` and then wonder why Touch ID appears: say why, and
-  // what works without a prompt. (get prints the value, so an unlock never covers it.)
-  const sess = await sessionCall({ op: "list" });
-  if (((sess && sess.sessions) || []).some((x) => x.scope === scope.label) && ENV_NAME.test(name)) {
-    out(`! ${scope.label} is unlocked, but csec get always asks for Touch ID (it prints the value).`);
-    out(`  Without a prompt: csec run -p ${scope.project || '""'} -e ${scope.env} -- sh -c '… "$${name}" …'  (use the variable; don't print it)`);
+  if (!name) die("Usage: csec get NAME [-p project] [-e env] [--ask]");
+  // Inside an unlock, `get` from that same session is almost always an agent using the wrong command.
+  // Prompting each time trains people to click OK, so refuse at once (no value, exit 1) and say what
+  // works. `get` prints the value, so an unlock never covers it; --ask asks for Touch ID on purpose.
+  if (!ask && existsSync(SESSION_SOCK)) {
+    const mine = await sessionCall({ op: "check", project: scope.project, env: scope.env, pid: process.pid });
+    if (mine && mine.ok) {
+      const run = `csec run -p ${scope.project || '""'} -e ${scope.env} -- sh -c '… "$${ENV_NAME.test(name) ? name : "NAME"}" …'`;
+      notifyUser(`csec get ${name} refused: ${scope.label} is unlocked. Use csec run (or csec get --ask).`);
+      die(`csec get is refused while ${scope.label} is unlocked in this session (it would print the value).\n  Use the value without printing it: ${run}\n  To read it on purpose, with Touch ID: csec get ${name} --ask`);
+    }
   }
   const it = inScope((await openVault(`read ${name} (${scope.label})`)).items, scope).find((x) => x.name === name);
   if (!it) die(`No secret named ${name} in ${scope.label}.`);
@@ -514,6 +519,11 @@ function sessionAnchor(pid) {
     cur = parent;
   }
   return null;
+}
+
+function notifyUser(text) {
+  if (TEST_MODE || !isMac) return;
+  try { spawn("osascript", ["-e", `display notification "${text.replace(/["\\]/g, "")}" with title "csec"`], { stdio: "ignore", detached: true }).unref(); } catch {}
 }
 
 function sessionCall(req, timeoutMs = 3000) {
@@ -607,13 +617,15 @@ async function sessionDaemon() {
         notify(`${req.label} unlocked for ${a.label}`);
         return reply({ ok: true, expires_at: now + ttl });
       }
-      if (req.op === "use") {
+      if (req.op === "check" || req.op === "use") {
         const x = sessions.get(key);
         if (!x) return reply({ ok: false });
         // Never trust the caller's word for its session: work it out from its process ID.
         const caller = procInfo(req.pid);
         const anchor = caller && /csec|catarina/.test(caller.command) ? sessionAnchor(req.pid) : null;
-        if (!anchor || anchor.pid !== x.anchor.pid || anchor.start !== x.anchor.start) { log(`refused ${key} for pid ${req.pid}`); return reply({ ok: false }); }
+        const same = !!anchor && anchor.pid === x.anchor.pid && anchor.start === x.anchor.start;
+        if (req.op === "check") { if (same) log(`get refused ${key} (use csec run)`); return reply({ ok: same }); }
+        if (!same) { log(`refused ${key} for pid ${req.pid}`); return reply({ ok: false }); }
         if (now >= x.expires || now - x.last >= SESSION_IDLE || x.uses >= SESSION_USES) { end(key, "time, idle or use limit"); return reply({ ok: false }); }
         x.last = now; x.uses++;
         const what = String(req.what || "").slice(0, 60);
@@ -1234,7 +1246,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.6" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.7" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }
@@ -1441,7 +1453,7 @@ const HELP = `csec — Catarina Secrets CLI
   csec init <project> [--env dev]   Create .csec.json in this folder (project + default env)
   csec run [-e env] -- <cmd> [args] Run a command with this project's secrets as env vars
   csec list [--all]                 List secret names for this project/env (or everything)
-  csec get NAME                     Print one secret to stdout
+  csec get NAME [--ask]             Print one secret to stdout (inside an unlock: refused unless --ask)
   csec set NAME [--all-envs]        Save a secret (value from a hidden prompt or stdin)
   csec set NAME --generate [--type T] [--length N]
                                     Create a random secret and save it without showing it
