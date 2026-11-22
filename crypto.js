@@ -351,12 +351,46 @@ export async function sealLabel(vk, purpose, id, text) {
   const b = await seal(vk, te.encode(String(text).slice(0, 100)), `${V}/label/${purpose}/${id}`);
   return `e1.${b.iv}.${b.ct}`;
 }
-/** Plain text of a label. Old plaintext labels pass through; a label that fails to open is flagged. */
+/** Plain text of a label. A label that isn't sealed (the server could plant one) or fails to open is flagged. */
 export async function openLabel(vk, purpose, id, s) {
-  if (!isSealedLabel(s)) return String(s || "");
+  if (!isSealedLabel(s)) return "⚠ unreadable name";
   const [, iv, ct] = s.match(LABEL_RE);
   try { return td.decode(await open(vk, { iv, ct }, `${V}/label/${purpose}/${id}`)); }
   catch { return "⚠ unreadable name"; }
+}
+
+// Device names are sealed together with a hash of the device's public keys (checked by fingerprint
+// when it was approved). Before the vault key is wrapped to a device again (rotation), the browser
+// checks the keys the server lists still match, so the server can't swap in a key of its own.
+export async function deviceKeyHash(signPubB64u, encPubB64u) {
+  return toB64u(new Uint8Array(await crypto.subtle.digest("SHA-256", concat(fromB64u(signPubB64u), fromB64u(encPubB64u)))));
+}
+export async function sealDeviceLabel(vk, d, name) {
+  const b = await seal(vk, te.encode(`${String(name).slice(0, 60)}\n${await deviceKeyHash(d.sign_pub, d.enc_pub)}`), `${V}/label/device-key/${d.id}`);
+  return `e1.${b.iv}.${b.ct}`;
+}
+/** { name, verified }: verified = sealed with this device's current public keys. */
+export async function openDeviceLabel(vk, d) {
+  if (!isSealedLabel(d.name)) return { name: "⚠ unreadable name", verified: false };
+  const [, iv, ct] = d.name.match(LABEL_RE);
+  try {
+    const text = td.decode(await open(vk, { iv, ct }, `${V}/label/device-key/${d.id}`));
+    const cut = text.lastIndexOf("\n");
+    if (text.slice(cut + 1) !== (await deviceKeyHash(d.sign_pub, d.enc_pub))) return { name: "⚠ device keys changed", verified: false, changed: true };
+    return { name: text.slice(0, cut), verified: true };
+  } catch {
+    return { name: await openLabel(vk, "device", d.id, d.name), verified: false }; // approved before key binding
+  }
+}
+
+// ---------- vault code ----------
+// A short code derived from the vault key. The vault page shows it and `csec login` prints it, so
+// the user can see the CLI got the real vault key (the server can't make up a matching one).
+export async function vaultCode(vkRaw) {
+  const base = await crypto.subtle.importKey("raw", vkRaw, "HKDF", false, ["deriveBits"]);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: te.encode(`${V}/vault-code`) }, base, 80));
+  return formatRecoveryKey(bits);
 }
 
 // ---------- signed vault manifest (detects rollback, hidden or swapped items) ----------
@@ -388,12 +422,13 @@ export async function signManifest(key, n, items) {
 }
 
 /**
- * Check what the server served. Returns "ok", "unsigned" (an old vault that has never had a
- * manifest), "missing" (it had one before), "mismatch" (forged, or items don't match) or
+ * Check what the server served. Returns "ok", "missing" (secrets without a signature),
+ * "mismatch" (forged, or items don't match) or
  * "rollback" (an older copy than this device has already seen).
  */
 export async function checkManifest(key, manifest, items, seenN = 0) {
-  if (!manifest) return seenN > 0 ? "missing" : items.length ? "unsigned" : "ok";
+  // Every vault has been signed since 2026-11-13: a vault with secrets but no signature means it was removed.
+  if (!manifest) return seenN > 0 || items.length ? "missing" : "ok";
   if (!Number.isInteger(manifest.n) || manifest.n < 1 || typeof manifest.mac !== "string") return "mismatch";
   let valid = false;
   try { valid = await crypto.subtle.verify("HMAC", key, fromB64u(manifest.mac), await manifestBytes(manifest.n, items)); } catch { valid = false; }

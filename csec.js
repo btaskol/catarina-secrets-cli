@@ -210,6 +210,20 @@ function seenSet(deviceId, n) {
     writeFileSync(seenFile, JSON.stringify({ [deviceId]: n }), { mode: 0o600 });
   } catch { /* read-only home: no memory, no crash */ }
 }
+// The vault code (crypto.js vaultCode) this computer got at login. Public-key wrapping doesn't prove
+// who wrapped the vault key, so a hostile server could hand this computer a key of its own; the
+// pinned code catches that (and the user compared it with the vault page at login).
+const pinFile = fileStore.replace(/\.json$/, ".vault.json");
+function pinGet(deviceId) {
+  try { return JSON.parse(readFileSync(pinFile, "utf8"))[deviceId] || null; } catch { return null; }
+}
+function pinSet(deviceId, code) {
+  let all = {};
+  try { all = JSON.parse(readFileSync(pinFile, "utf8")); } catch {}
+  mkdirSync(join(homedir(), ".config", "catarina"), { recursive: true, mode: 0o700 });
+  writeFileSync(pinFile, JSON.stringify({ ...all, [deviceId]: code }), { mode: 0o600 });
+}
+
 const INTEGRITY_TEXT = {
   rollback: "the server sent an older copy of your vault than this computer has already seen",
   mismatch: "the vault's contents don't match the signature your own devices wrote",
@@ -229,7 +243,7 @@ async function signedItemWrite(ctx, path, body, rows) {
 }
 
 // ---------- vault access ----------
-async function openVault(reason, unlocked) {
+async function openVault(reason, unlocked, { trustCode = null } = {}) {
   const rec = unlocked || loadDevice();
   if (!rec) die("This computer isn't linked. Run: csec login");
   const dev = unlocked || (await unlockDevice(rec, reason || "use your Catarina secrets"));
@@ -238,6 +252,16 @@ async function openVault(reason, unlocked) {
   if (status !== 200) die(`Server error (${status} ${data.error || ""})`);
   const encPriv = await crypto.subtle.importKey("pkcs8", C.fromB64u(dev.enc_priv), { name: "X25519" }, false, ["deriveBits"]);
   const vkRaw = await C.unwrapVaultKeyForDevice(encPriv, dev.enc_pub, data.wrap, dev.device_id);
+  const code = await C.vaultCode(vkRaw);
+  const pinned = pinGet(dev.device_id);
+  if (trustCode && code.replace(/-/g, "") === trustCode.toUpperCase().replace(/[^0-9A-Z]/g, "")) pinSet(dev.device_id, code);
+  else if (!pinned) pinSet(dev.device_id, code); // first use (login, or a device linked before vault codes)
+  else if (pinned !== code) {
+    vkRaw.fill(0);
+    die(`The server sent a different vault key than this computer knows (vault code ${code}, expected ${pinned}).\n` +
+      `  If you rotated your vault key: check the vault page shows ${code} under Devices, then run: csec trust-vault ${code}\n` +
+      "  If you didn't, don't use this computer's csec until it's checked, and report it to security@getcatarina.com.");
+  }
   const vk = await C.importVaultKey(vkRaw);
   const macKey = await C.backupMacKey(vkRaw);
   const manKey = await C.manifestKey(vkRaw);
@@ -257,7 +281,7 @@ async function openVault(reason, unlocked) {
     try { trash.push({ ...(await C.decryptItem(vk, it.id, it.blob)), id: it.id, version: it.version, deleted_at: it.deleted_at, deleted_by: it.deleted_by }); }
     catch { /* unreadable trash entry: ignore */ }
   }
-  return { dev, vk, macKey, manKey, items, trash, raw: data };
+  return { dev, vk, macKey, manKey, items, trash, raw: data, code };
 }
 
 /** Encrypt on this device and upload. entries: [{ existing?: item, data: {name, value, notes, project, env} }] */
@@ -426,10 +450,11 @@ async function login(args) {
     const { status, data } = await signedFetch(pending, `/api/device/enroll/${id}`);
     if (status === 200 && data.status === "approved") {
       const full = { ...pending, server: BASE, linked_at: new Date().toISOString() };
-      const { items } = await openVault(null, full); // proves the wrapped key decrypts on this device
+      const { items, code } = await openVault(null, full); // proves the wrapped key decrypts on this device
       const sealed = !noTouch && isMac ? await sealDevice(full) : null;
       saveDevice(sealed || full);
       out(`✓ Linked. ${items.length} secret(s) available. Keys stored in ${FILE_STORE ? fileStore : "the macOS Keychain"}.`);
+      out(`  Vault code: ${code}  (check it matches the one under Devices on the vault page)`);
       out(sealed ? "✓ Touch ID required: keys are sealed by the Secure Enclave." : "! Touch ID protection is off (any process running as you can use these keys).");
       return;
     }
@@ -519,6 +544,14 @@ async function sshAdd(args) {
   if (code !== 0) die(`ssh-add failed (exit ${code}).`, code);
   out(`✓ ${name} is in ssh-agent until ${fmtTime(Math.floor(Date.now() / 1000) + ttl)} (memory only, nothing written to disk).${confirmEach ? " Each use asks you to confirm." : ""}`);
   out("  Remove it sooner with: ssh-add -D");
+}
+
+// `csec trust-vault CODE`: accept a new vault key after a rotation, once the user has compared codes.
+async function trustVault(args) {
+  const want = args[0];
+  if (!want || !/^[0-9A-Za-z-]{16,19}$/.test(want)) die("Usage: csec trust-vault VAULT-CODE   (shown under Devices on the vault page)");
+  const { code } = await openVault("trust the new vault key", undefined, { trustCode: want });
+  out(`✓ This computer now trusts vault code ${code}.`);
 }
 
 // ---------- unlock sessions: one Touch ID for a project, for a while ----------
@@ -1284,7 +1317,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.8" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.9" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }
@@ -1329,6 +1362,7 @@ async function status() {
   out(`Touch ID: ${dev.sealed ? "required (Secure Enclave)" : "off — turn on with: csec touchid on"}`);
   const signPub = dev.sign_pub || (dev.sign_priv ? C.toB64u(new Uint8Array(await crypto.subtle.exportKey("raw", await publicFromPkcs8(dev.sign_priv)))) : null);
   if (signPub) out(`Fingerprint: ${await C.deviceFingerprint(signPub, dev.enc_pub)}`);
+  out(`Vault code: ${pinGet(dev.device_id) || "not seen yet (shown after the next command that opens the vault)"}`);
   const s = await sessionCall({ op: "list" });
   for (const x of (s && s.sessions) || []) out(`Unlocked: ${x.scope} for ${x.who} until ${fmtTime(x.until)} (${x.uses} use(s)). End with: csec lock`);
 }
@@ -1519,7 +1553,8 @@ const HELP = `csec — Catarina Secrets CLI
                                     One Touch ID, then csec run skips it for this project in this
                                     terminal / agent session (max 8h; ends on lock, sleep, 30 min idle)
   csec lock                         End every unlock now
-  csec status                       Show link status, device fingerprint, current scope and unlocks
+  csec status                       Show link status, device fingerprint, vault code, scope and unlocks
+  csec trust-vault CODE             After rotating the vault key: accept the new vault code
   csec logout                       Revoke this device and delete its keys
   csec scan [dir] [--history] [--json]
                                     Find API keys and passwords in files (and git history). Offline, no account
@@ -1533,7 +1568,7 @@ const HELP = `csec — Catarina Secrets CLI
 Server: ${BASE}  (override with CATARINA_URL)`;
 
 const [cmd, ...args] = process.argv.slice(2);
-const commands = { login, init, run, get, list, ls: list, set, gen, delete: del, rm: del, trash, restore, purge, backup, import: importEnv, status, logout, "access-token": accessToken, grant, grants, revoke, proxy, connect: connectCmd, touchid, mcp, scan, unlock, lock, "ssh-add": sshAdd, "session-daemon": sessionDaemon };
+const commands = { login, init, run, get, list, ls: list, set, gen, delete: del, rm: del, trash, restore, purge, backup, import: importEnv, status, logout, "access-token": accessToken, grant, grants, revoke, proxy, connect: connectCmd, touchid, mcp, scan, unlock, lock, "ssh-add": sshAdd, "trust-vault": trustVault, "session-daemon": sessionDaemon };
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") { out(HELP); process.exit(0); }
 if (cmd === "version" || cmd === "--version" || cmd === "-v") {
   // The npm build writes package.json next to csec.js; in the repo it's two folders up.
