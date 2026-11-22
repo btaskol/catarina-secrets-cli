@@ -483,6 +483,44 @@ async function get(args) {
   process.stdout.write(it.value + (process.stdout.isTTY ? "\n" : ""));
 }
 
+/** An OpenSSH/PEM private key from a secret: stored as-is (csec set NAME < ~/.ssh/key) or base64 of it. */
+function sshKeyFrom(value) {
+  const v = String(value).trim();
+  const PEM = /^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
+  if (PEM.test(v)) return v + "\n";
+  if (/^[A-Za-z0-9+/=\s]+$/.test(v)) {
+    const d = Buffer.from(v.replace(/\s+/g, ""), "base64").toString("utf8").trim();
+    if (PEM.test(d)) return d + "\n";
+  }
+  return null;
+}
+
+// `csec ssh-add NAME --for 1h`: put an SSH key from the vault into ssh-agent for a limited time.
+// The key goes from memory to ssh-agent over a pipe: never to disk, never to the terminal.
+// Always asks for Touch ID (an unlock doesn't cover it), like `get`: once loaded, the agent can sign.
+async function sshAdd(args) {
+  const ttl = parseDuration(takeFlag(args, ["--for"]) ?? "1h");
+  const confirmEach = takeFlag(args, ["--confirm", "-c"], true);
+  const scope = resolveScope(args);
+  const name = args[0];
+  if (!name || args.length > 1) die("Usage: csec ssh-add NAME [--for 1h] [--confirm] [-p project] [-e env]");
+  if (!process.env.SSH_AUTH_SOCK) die("No ssh-agent found (SSH_AUTH_SOCK is not set). Start one with: eval \"$(ssh-agent)\"");
+  const it = inScope((await openVault(`add SSH key ${name} (${scope.label}) to ssh-agent for ${Math.round(ttl / 60)} min`)).items, scope).find((x) => x.name === name);
+  if (!it) die(`No secret named ${name} in ${scope.label}.`);
+  const key = sshKeyFrom(it.value);
+  if (!key) die(`${name} doesn't look like an SSH private key. Save one with: csec set ${name} < ~/.ssh/id_ed25519`);
+  const child = spawn("ssh-add", ["-t", String(ttl), ...(confirmEach ? ["-c"] : []), "-"], { stdio: ["pipe", "inherit", "inherit"] });
+  const code = await new Promise((resolve) => {
+    child.on("error", (e) => { out(`✗ Could not run ssh-add: ${e.message}`); resolve(127); });
+    child.on("exit", (c) => resolve(c ?? 1));
+    child.stdin.on("error", () => {});
+    child.stdin.end(key);
+  });
+  if (code !== 0) die(`ssh-add failed (exit ${code}).`, code);
+  out(`✓ ${name} is in ssh-agent until ${fmtTime(Math.floor(Date.now() / 1000) + ttl)} (memory only, nothing written to disk).${confirmEach ? " Each use asks you to confirm." : ""}`);
+  out("  Remove it sooner with: ssh-add -D");
+}
+
 // ---------- unlock sessions: one Touch ID for a project, for a while ----------
 // `csec unlock` decrypts ONE project/env (minus secrets tagged "always-ask") and hands the values to a
 // small background helper that keeps them in memory only. `csec run` for that scope then skips Touch ID,
@@ -899,9 +937,9 @@ async function init(args) {
 
 // ---------- broker grants (AI agents) ----------
 function parseDuration(text) {
-  const m = String(text).match(/^(\d+)(s|m|h)$/);
+  const m = String(text).trim().toLowerCase().match(/^(\d+)\s*(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)$/);
   if (!m) die(`Invalid duration "${text}" (use e.g. 90s, 15m, 2h).`);
-  const secs = Number(m[1]) * { s: 1, m: 60, h: 3600 }[m[2]];
+  const secs = Number(m[1]) * { s: 1, m: 60, h: 3600 }[m[2][0]];
   if (secs < 60 || secs > 86400) die("Duration must be between 1m and 24h.");
   return secs;
 }
@@ -1246,7 +1284,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.7" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.8" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }
@@ -1457,6 +1495,8 @@ const HELP = `csec — Catarina Secrets CLI
   csec set NAME [--all-envs]        Save a secret (value from a hidden prompt or stdin)
   csec set NAME --generate [--type T] [--length N]
                                     Create a random secret and save it without showing it
+  csec ssh-add NAME [--for 1h] [--confirm]
+                                    Load an SSH key from the vault into ssh-agent for a while (never on disk)
   csec gen [--type T] [--length N]  Print a random secret. Types: password (default), alnum, hex, b64u
   csec backup [-o file]             Write an encrypted backup file (restore it in the vault page)
   csec delete NAME [--all-envs]     Move a secret to the trash (restorable for 30 days)
@@ -1493,7 +1533,7 @@ const HELP = `csec — Catarina Secrets CLI
 Server: ${BASE}  (override with CATARINA_URL)`;
 
 const [cmd, ...args] = process.argv.slice(2);
-const commands = { login, init, run, get, list, ls: list, set, gen, delete: del, rm: del, trash, restore, purge, backup, import: importEnv, status, logout, "access-token": accessToken, grant, grants, revoke, proxy, connect: connectCmd, touchid, mcp, scan, unlock, lock, "session-daemon": sessionDaemon };
+const commands = { login, init, run, get, list, ls: list, set, gen, delete: del, rm: del, trash, restore, purge, backup, import: importEnv, status, logout, "access-token": accessToken, grant, grants, revoke, proxy, connect: connectCmd, touchid, mcp, scan, unlock, lock, "ssh-add": sshAdd, "session-daemon": sessionDaemon };
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") { out(HELP); process.exit(0); }
 if (cmd === "version" || cmd === "--version" || cmd === "-v") {
   // The npm build writes package.json next to csec.js; in the repo it's two folders up.

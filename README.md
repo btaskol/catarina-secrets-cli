@@ -96,6 +96,13 @@ It covers one project and environment, only `csec run`, and only the terminal ta
 that unlocked it. It ends after the time you chose, 30 minutes idle, 200 uses, or when your Mac locks
 or sleeps. Secrets tagged `always-ask` are never included.
 
+SSH keys: save one once, then load it into ssh-agent for a limited time (never written to disk):
+
+```sh
+csec set DEPLOY_SSH_KEY < ~/.ssh/id_ed25519   # raw or base64, both work
+csec ssh-add DEPLOY_SSH_KEY --for 1h          # Touch ID every time; --confirm asks on each use
+```
+
 ## Claude Code
 
 Give Claude Code the MCP server, so it can **use** a key without ever reading it:
