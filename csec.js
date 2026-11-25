@@ -3,7 +3,7 @@
 // Device keys live in the macOS Keychain (or a 0600 file elsewhere). Secrets are decrypted
 // in memory for each command and never written to disk.
 
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { createServer as netServer, createConnection } from "node:net";
 import { hostname, homedir, platform, constants as osConstants } from "node:os";
@@ -73,7 +73,7 @@ async function seHelper() {
   if (!isMac) return null;
   const src = readFileSync(SE_SOURCE);
   const tag = Buffer.from(await crypto.subtle.digest("SHA-256", src)).toString("hex").slice(0, 12);
-  const dir = join(homedir(), ".config", "catarina", "bin");
+  const dir = (process.env.CSEC_TEST_FILE_STORE === "1" && process.env.CSEC_TEST_BIN_DIR) || join(homedir(), ".config", "catarina", "bin");
   const bin = join(dir, `csec-se-${tag}`);
   if (!existsSync(bin)) {
     out("… Building the Touch ID helper (one time, ~30 s)");
@@ -569,6 +569,9 @@ const SESSION_MAX = 8 * 3600, SESSION_IDLE = 30 * 60, SESSION_USES = 200;
 const ALWAYS_ASK = "always-ask";
 const WRAPPER_RE = /(^|\/)(sh|bash|zsh|dash|fish)\s+(-\S+\s+)*-\w*c\b|(^|\/)npx\b|npm-cli\.js|npm exec|(^|\/)npm\s+(run|exec)\b|(^|\s|\/)(csec|catarina\.js)(\s|$)/;
 
+// The program itself is csec (`csec …`, `node …/catarina.js …`, `node …/csec.js …`), not just mentions it.
+const CSEC_CMD_RE = /^(\S*\/)?csec(\s|$)|^\S*node\S*\s+(\S*\/)?(catarina\.js|csec\.js|csec)(\s|$)/;
+
 function procInfo(pid) {
   try {
     const line = execFileSync("ps", ["-o", "ppid=,lstart=,command=", "-p", String(pid)], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
@@ -634,6 +637,7 @@ async function unlock(args) {
   const ask = scoped.filter((it) => (it.tags || []).includes(ALWAYS_ASK)).map((it) => it.name);
   const values = Object.fromEntries(scoped.filter((it) => !ask.includes(it.name)).map((it) => [it.name, it.value]));
   if (!Object.keys(values).length) die(`Nothing to unlock in ${scope.label}${ask.length ? ` (only "${ALWAYS_ASK}" secrets)` : ""}.`);
+  if (isMac && !(await seHelper())) die("Couldn't build the Touch ID helper, which the session helper needs to check who's asking.");
   if (!(await ensureSessionDaemon())) die("Couldn't start the session helper.");
   const r = await sessionCall({ op: "add", project: scope.project, env: scope.env, values, ask, anchor, ttl, label: scope.label });
   if (!r || !r.ok) die(`Couldn't unlock (${(r && r.error) || "no answer from the session helper"}).`);
@@ -667,6 +671,16 @@ async function sessionDaemon() {
   const endAll = (why) => { for (const k of [...sessions.keys()]) end(k, why); };
   const anchorAlive = (a) => { const p = procInfo(a.pid); return !!p && p.start === a.start; };
 
+  const helper = await seHelper();
+  // The kernel's answer to "which process is connected?" (the Swift helper reads LOCAL_PEERPID on fd 3).
+  const peerPid = (sock) => {
+    const fd = sock._handle && sock._handle.fd;
+    if (!helper || !(fd >= 0)) return null;
+    const r = spawnSync(helper, ["peerpid"], { stdio: ["ignore", "pipe", "ignore", fd], timeout: 3000 });
+    const n = Number(String(r.stdout || "").trim());
+    return r.status === 0 && Number.isInteger(n) && n > 1 ? n : null;
+  };
+
   const server = netServer((sock) => {
     let buf = "";
     sock.on("data", (d) => {
@@ -691,12 +705,15 @@ async function sessionDaemon() {
       if (req.op === "check" || req.op === "use") {
         const x = sessions.get(key);
         if (!x) return reply({ ok: false });
-        // Never trust the caller's word for its session: work it out from its process ID.
-        const caller = procInfo(req.pid);
-        const anchor = caller && /csec|catarina/.test(caller.command) ? sessionAnchor(req.pid) : null;
+        // Never trust the caller's word for who it is: ask the kernel which process is on the other
+        // end of this connection, then work out its session from that.
+        const pid = peerPid(sock);
+        if (!pid) { log(`refused ${key}: couldn't identify the caller`); return reply({ ok: false }); }
+        const caller = procInfo(pid);
+        const anchor = caller && CSEC_CMD_RE.test(caller.command) ? sessionAnchor(pid) : null;
         const same = !!anchor && anchor.pid === x.anchor.pid && anchor.start === x.anchor.start;
         if (req.op === "check") { if (same) log(`get refused ${key} (use csec run)`); return reply({ ok: same }); }
-        if (!same) { log(`refused ${key} for pid ${req.pid}`); return reply({ ok: false }); }
+        if (!same) { log(`refused ${key} for pid ${pid}`); return reply({ ok: false }); }
         if (now >= x.expires || now - x.last >= SESSION_IDLE || x.uses >= SESSION_USES) { end(key, "time, idle or use limit"); return reply({ ok: false }); }
         x.last = now; x.uses++;
         const what = String(req.what || "").slice(0, 60);
@@ -1317,7 +1334,7 @@ async function mcp() {
         return {
           protocolVersion: (msg.params && msg.params.protocolVersion) || "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "catarina-secrets", version: "0.1.9" },
+          serverInfo: { name: "catarina-secrets", version: "0.1.10" },
           instructions: "Use call_api to call external APIs with the user's secrets without seeing them. Never ask the user to paste secret values into the chat.",
         };
       }

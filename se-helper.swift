@@ -30,7 +30,16 @@ func emit(_ obj: [String: String]) {
 
 func run() throws {
     let args = CommandLine.arguments
-    guard args.count >= 2 else { throw Fail(message: "usage: csec-se create | derive --reason TEXT | watch") }
+    guard args.count >= 2 else { throw Fail(message: "usage: csec-se create | derive --reason TEXT | watch | peerpid") }
+    if args[1] == "peerpid" {
+        // fd 3 is a connected unix socket handed over by the session helper: print the process ID of
+        // the program on the other end, as the kernel knows it (SOL_LOCAL = 0, LOCAL_PEERPID = 2).
+        var pid: pid_t = 0
+        var len = socklen_t(MemoryLayout<pid_t>.size)
+        guard getsockopt(3, 0, 2, &pid, &len) == 0, pid > 0 else { throw Fail(message: "no_peer") }
+        print(pid)
+        return
+    }
     if args[1] == "watch" {
         let say = { (what: String) in print(what); fflush(stdout) }
         DistributedNotificationCenter.default().addObserver(
